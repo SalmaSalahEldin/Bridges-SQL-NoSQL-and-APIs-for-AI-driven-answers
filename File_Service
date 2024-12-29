@@ -19,28 +19,7 @@ logging.getLogger("azure").setLevel(logging.CRITICAL)
 logging.getLogger("ingester").setLevel(logging.CRITICAL)
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.CRITICAL)
 
-# file_path = "/home/salma/PycharmProjects/people-mate-salma/mate20/ArkLeap.pdf"
-# file_path = '/home/salma/Downloads/Lab-Setup-158844syfvjvvbbub.pdf'
-# file_path = '/home/salma/Downloads/law2003.pdf'
-file_path ="/home/salma/Arkleap/PDFs/Book.pdf"
-# file_path = "/home/salma/Downloads/png2pdf (1).pdf"
-# file_path = "/home/salma/Arkleap/PDFs/samples.pdf"
-# file_path = "/home/salma-salah/Thinkpad/Arkleap/PDFs/Traveling Policy121648bgff.pdf"
-# file_path = "/home/salma/Arkleap/PDFs/Policies-and-Procedures-Manual-Internal-and-External.pdf"
-# file_path = "/home/salma-salah/Thinkpad/Arkleap/PDFs/Book.pdf"
-# file_path = "/home/salma/Arkleap/PDFs/png2pdf.pdf"
-# file_path = "/home/salma/Arkleap/PDFs/Advance.pdf"
-# file_path = "/home/salma/Arkleap/PDFs/insurance.pdf"
-# file_path = "/home/salma/Arkleap/PDFs/TextToTestLangchain.pdf"
-# file_path = "/home/salma/Downloads/people-mate-cloud-sprint7/people-mate-cloud/people_mate/media/uploads/company_files/AekLeap.pdf"
-# file_path = "/home/salma/Arkleap/PDFs/TravelAndBook.pdf"
-# file_path ="/home/salma/Arkleap/PDFs/BookAverage.pdf"
-# file_path ="/home/salma/Arkleap/PDFs/RotationSample.pdf"
-# file_path ="/home/salma/Arkleap/PDFs/JustText.pdf"
-# file_path ="/home/salma/Arkleap/PDFs/ArabicTraversed.pdf"
-# file_path = "/home/salma/Arkleap/Traveling Policy121648bgff.pdf"
-file_path_old = '/home/salma-salah/Thinkpad/Arkleap/PDFs/Traveling Policy121648bgff.pdf'
-file_path_new = '/home/salma/Downloads/Traveling Policy.pdf'
+file_path = "/home/salma/Arkleap/PDFs/Policies-and-Procedures-Manual-Internal-and-External.pdf"
 
 class AiCompanyFileService:
     def __init__(self, company_id=None):
