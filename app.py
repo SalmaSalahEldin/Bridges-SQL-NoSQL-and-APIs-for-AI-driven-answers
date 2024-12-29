@@ -173,7 +173,7 @@ def generate_question_id(session_question_ids):
 def handle_user_query(input_text, session_name, session_question_ids):
     if not session_name:
         session_name = generate_session_name()
-    question_id = generate_question_id(session_question_ids)
+    question_id = str(generate_question_id(session_question_ids))
 
     params = {
         'question_id': question_id,
