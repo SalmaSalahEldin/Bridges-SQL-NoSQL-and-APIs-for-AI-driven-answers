@@ -1,0 +1,258 @@
+import os
+import shutil
+import psycopg2
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from Tables_Extraction import DocumentAnalysisParser
+from PyPDF2 import PdfReader
+import asyncio
+from dotenv import load_dotenv
+import warnings
+import logging
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+logging.getLogger("chromadb").setLevel(logging.CRITICAL)
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("azure").setLevel(logging.CRITICAL)
+logging.getLogger("ingester").setLevel(logging.CRITICAL)
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.CRITICAL)
+
+# file_path = "/home/salma/PycharmProjects/people-mate-salma/mate20/ArkLeap.pdf"
+# file_path = '/home/salma/Downloads/Lab-Setup-158844syfvjvvbbub.pdf'
+# file_path = '/home/salma/Downloads/law2003.pdf'
+file_path ="/home/salma/Arkleap/PDFs/Book.pdf"
+# file_path = "/home/salma/Downloads/png2pdf (1).pdf"
+# file_path = "/home/salma/Arkleap/PDFs/samples.pdf"
+# file_path = "/home/salma-salah/Thinkpad/Arkleap/PDFs/Traveling Policy121648bgff.pdf"
+# file_path = "/home/salma/Arkleap/PDFs/Policies-and-Procedures-Manual-Internal-and-External.pdf"
+# file_path = "/home/salma-salah/Thinkpad/Arkleap/PDFs/Book.pdf"
+# file_path = "/home/salma/Arkleap/PDFs/png2pdf.pdf"
+# file_path = "/home/salma/Arkleap/PDFs/Advance.pdf"
+# file_path = "/home/salma/Arkleap/PDFs/insurance.pdf"
+# file_path = "/home/salma/Arkleap/PDFs/TextToTestLangchain.pdf"
+# file_path = "/home/salma/Downloads/people-mate-cloud-sprint7/people-mate-cloud/people_mate/media/uploads/company_files/AekLeap.pdf"
+# file_path = "/home/salma/Arkleap/PDFs/TravelAndBook.pdf"
+# file_path ="/home/salma/Arkleap/PDFs/BookAverage.pdf"
+# file_path ="/home/salma/Arkleap/PDFs/RotationSample.pdf"
+# file_path ="/home/salma/Arkleap/PDFs/JustText.pdf"
+# file_path ="/home/salma/Arkleap/PDFs/ArabicTraversed.pdf"
+# file_path = "/home/salma/Arkleap/Traveling Policy121648bgff.pdf"
+file_path_old = '/home/salma-salah/Thinkpad/Arkleap/PDFs/Traveling Policy121648bgff.pdf'
+file_path_new = '/home/salma/Downloads/Traveling Policy.pdf'
+
+class AiCompanyFileService:
+    def __init__(self, company_id=None):
+        load_dotenv()
+
+        self.db_config = {
+            "dbname": os.environ.get("DB_NAME_V1"),
+            "user": os.environ.get("DB_USER_V1"),
+            "password": os.environ.get("DB_PASSWORD_V1"),
+            "host": os.environ.get("DB_HOST_V1"),
+            "port": int(os.environ.get("DB_PORT_V1", 5432))
+        }
+
+        self.start_connection = self.connect_to_postgres()
+        self.cursor = self.start_connection.cursor()
+
+        self.company_id = "mate" + str(company_id)
+        self.schema_name = self.company_id
+        self.company_path = os.path.curdir + f"/Chroma/{self.company_id}"
+        self.API_KEY = os.environ["OPENAI_API_KEY"]
+        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        self.company_path_chunks = os.path.curdir + f"/Chroma/{self.company_id}/chunks"
+        self.company_path_questions = os.path.curdir + f"/Chroma/{self.company_id}/questions"
+        self.questions_collection_name = 'questions' + self.company_id
+        self.questions_vectorstore = Chroma(
+            collection_name=self.questions_collection_name,
+            embedding_function=self.embeddings,
+            persist_directory=self.company_path_questions,
+        )
+        self.collection_name = self.company_id
+
+        self.chunks_vectorstore = Chroma(
+            collection_name=self.collection_name,
+            embedding_function=self.embeddings,
+            persist_directory=self.company_path_chunks,
+        )
+    def connect_to_postgres(self):
+        connection = psycopg2.connect(**self.db_config)
+        return connection
+
+    def close_connection(self):
+        self.start_connection.close()
+
+    def create_schema_if_not_exists(self, schema_name):
+        try:
+            self.cursor.execute(
+                f"SELECT schema_name FROM information_schema.schemata WHERE schema_name = '{schema_name}'")
+            schema_exists = self.cursor.fetchone()
+            if not schema_exists:
+                self.cursor.execute(f"CREATE SCHEMA IF NOT EXISTS \"{schema_name}\"")
+                self.start_connection.commit()
+                print(f"Schema '{schema_name}' created successfully.")
+            else:
+                print(f"Schema '{schema_name}' already exists.")
+
+        except Exception as e:
+            print(f"Error while creating schema: {e}")
+            self.start_connection.rollback()
+
+    def _response(self, data, type):
+        response = {"data": data,
+                    "type": type}
+        return response
+
+    async def extract_tables_azure(self, file_path):
+        parser = DocumentAnalysisParser(schema_name=self.schema_name)
+        await parser.pdf_to_postgres(file_path)
+
+    async def get_or_create_pdf_and_question_collection_for_company(self, file_path, filename):
+        table_extraction_task = asyncio.create_task(self.extract_tables_azure(file_path))
+        try:
+            reader = PdfReader(file_path)
+            documents = [page.extract_text() for page in reader.pages]
+        except Exception as e:
+            return self._response(f"Error reading PDF with PyPDF2: {e}", "Error")
+
+        corrected_docs = [doc for doc in documents]
+
+        text_splitter = SemanticChunker(self.embeddings)
+        chunks = text_splitter.create_documents(corrected_docs)
+        chunked_docs = [doc.page_content for doc in chunks]
+
+        docs = chunked_docs
+        length_chunks = len(docs)
+
+        if filename is None:
+            filename = os.path.basename(file_path)
+        if not filename.lower().endswith('.pdf'):
+            filename += '.pdf'
+
+        unique_filename = os.path.basename(file_path)
+        user_friendly_name = filename
+
+        meta_data = {
+            "UniqueFileName": unique_filename,
+            "UserFriendlyName": user_friendly_name,
+        }
+        ids = [f"{unique_filename}_id{x}" for x in range(length_chunks)]
+        metadatas = [meta_data for _ in range(length_chunks)]
+
+        try:
+            dbchunks = self.chunks_vectorstore.from_texts(
+                texts=docs,
+                embedding=self.embeddings,
+                metadatas=metadatas,
+                ids=ids,
+                persist_directory=self.company_path_chunks,
+                collection_name=self.collection_name
+            )
+            dbchunks.persist()
+            print("Chroma index loaded or created successfully.")
+        except RuntimeError as e:
+            print("Creating Chroma index from scratch due to RuntimeError:", str(e))
+        except Exception as e:
+            return self._response(f"Error occurred: {e}", "Error")
+
+        combined_table = await table_extraction_task
+        if combined_table is not None:
+            print("Tables extracted and saved.")
+
+        self.cursor.execute(
+            """INSERT INTO pdf_data (id, pdf_name, chunks) VALUES (%s, %s, %s)""",
+            (self.company_id, unique_filename, length_chunks)
+        )
+        self.start_connection.commit()
+        return self._response(f"Done inserting {user_friendly_name} to embeddings", "validate")
+
+    def get_or_create_pdf_data_table(self):
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_data (
+                id VARCHAR(300),
+                pdf_name VARCHAR(200) NOT NULL,
+                chunks INT NOT NULL,
+                PRIMARY KEY(id, pdf_name)
+            )""")
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_questions_ids (
+                pdf_name VARCHAR(200) NOT NULL,
+                id VARCHAR(300),
+                PRIMARY KEY(id, pdf_name)
+            )""")
+        self.start_connection.commit()
+
+    def update_pdf_for_company(self, file_path_old, file_path_new):
+        if (not os.path.exists(file_path_old)):
+            return self._response("This old file doesn't exist", "Error")
+        if (not os.path.exists(file_path_new)):
+            return self._response("This new file doesn't exist", "Error")
+        self.delete_pdf_for_company(file_path_old)
+        self.get_or_create_pdf_and_question_collection_for_company(file_path_new)
+        return self._response("This pdf is already uploaded successfully", "Validation")
+
+    def delete_pdf_for_company(self, file_path, filename=None):
+        if filename is None:
+            filename = os.path.basename(file_path)
+        if not filename.lower().endswith('.pdf'):
+            filename += '.pdf'
+
+        unique_filename = os.path.basename(file_path)
+
+        try:
+            self.cursor.execute("SELECT chunks FROM pdf_data WHERE id = %s AND pdf_name = %s",
+                                (self.company_id, unique_filename))
+            chunks = self.cursor.fetchone()
+            if chunks is None:
+                return self._response("No file with this name", "Error")
+            chunks = chunks[0]
+            ids = [f"{unique_filename}_id{x}" for x in range(chunks)]
+            self.chunks_vectorstore.delete(ids=ids)
+            self.chunks_vectorstore.persist()
+            self.cursor.execute("DELETE FROM pdf_data WHERE id = %s AND pdf_name = %s",
+                                (self.company_id, unique_filename))
+            self.cursor.execute("SELECT id FROM pdf_questions_ids WHERE pdf_name = %s", (unique_filename,))
+            question_ids = [str(row[0]) for row in self.cursor.fetchall()]
+            if question_ids:
+                self.cursor.execute("DELETE FROM pdf_questions_ids WHERE pdf_name = %s", (unique_filename,))
+                self.questions_vectorstore.delete(ids=question_ids)
+                self.questions_vectorstore.persist()
+            unique_filename = os.path.splitext(unique_filename)[0].strip()
+            unique_filename = unique_filename.replace('-', ' ')
+            self.cursor.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+            """, (self.schema_name,))
+            query = f"""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = '{self.schema_name}' AND table_name LIKE '{unique_filename}%'
+            """
+            self.cursor.execute(query)
+            tables_to_delete = [row[0] for row in self.cursor.fetchall()]
+            for table in tables_to_delete:
+                self.cursor.execute(f'DROP TABLE IF EXISTS "{self.schema_name}"."{table}" CASCADE;')
+
+            self.start_connection.commit()
+        except RuntimeError:
+            return self._response("RuntimeError encountered", "Error")
+        except Exception as e:
+            return self._response(f"Exception: {e}", "Error")
+        self.start_connection.commit()
+        return self._response(
+            f"Rows with id = {self.company_id} and filename = {filename} deleted successfully from both the PostgreSQL database and the Chroma collection.",
+            "Validation"
+        )
+
+    def show_table_content(self):
+        self.cursor.execute("SELECT * FROM pdf_data")
+        columns = [desc[0] for desc in self.cursor.description]
+        print("Column Names:", columns)
+        rows = self.cursor.fetchall()
+        print("\nTable Content:")
+        for row in rows:
+            print(row)
+
