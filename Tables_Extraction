@@ -1,0 +1,265 @@
+import gc
+import os
+import html
+import logging
+from typing import IO, AsyncGenerator
+from azure.ai.documentintelligence.aio import DocumentIntelligenceClient 
+from azure.ai.documentintelligence.models import DocumentTable 
+from azure.core.credentials import AzureKeyCredential
+from openpyxl import Workbook
+from bs4 import BeautifulSoup
+import pandas as pd
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+import psycopg2
+
+load_dotenv()
+
+API_KEY = ""
+ENDPOINT = ""
+
+logger = logging.getLogger("ingester")
+logging.basicConfig(level=logging.INFO)
+
+def rename_duplicate_columns(df):
+    column_counts = {}
+    new_columns = []
+    for col in df.columns:
+        if col in column_counts:
+            column_counts[col] += 1
+            new_columns.append(f"{column_counts[col]}.{col}")
+        else:
+            column_counts[col] = 0
+            new_columns.append(col)
+    df.columns = new_columns
+
+def get_table_page_numbers(table):
+    return [region.page_number for region in table.bounding_regions]
+
+def get_table_span_offsets(table):  
+    if table.spans:
+        min_offset = table.spans[0].offset
+        max_offset = table.spans[0].offset + table.spans[0].length
+        for span in table.spans:
+            if span.offset < min_offset:
+                min_offset = span.offset
+            if span.offset + span.length > max_offset:
+                max_offset = span.offset + span.length
+        return min_offset, max_offset
+    else:
+        return -1, -1         
+
+
+def merge_horizontal_tables(table1, table2): 
+    table1.cells.extend(table2.cells)
+    return table1
+
+def merge_vertical_tables(table1, table2):   
+
+    for cell in table2.cells:
+        cell.row_index += table1.row_count
+    table1.row_count += table2.row_count
+    table1.cells.extend(table2.cells)
+    return table1
+
+
+class DocumentAnalysisParser:
+    def __init__(self, schema_name: str, endpoint: str = ENDPOINT, credential: AzureKeyCredential = AzureKeyCredential(API_KEY),
+                 model_id="prebuilt-layout"):
+
+        self.schema_name = schema_name
+        self.model_id = model_id
+        self.endpoint = endpoint
+        self.credential = credential
+        self.db_config = {
+            "dbname": os.environ.get("DB_NAME_V1"),
+            "user": os.environ.get("DB_USER_V1"),
+            "password": os.environ.get("DB_PASSWORD_V1"),
+            "host": os.environ.get("DB_HOST_V1"),
+            "port": int(os.environ.get("DB_PORT_V1", 5432)),
+        }
+        self.db_uri = (f"postgresql://{self.db_config['user']}:{self.db_config['password']}"
+                       f"@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}")
+
+        self.start_connection = self.connect_to_postgres()
+        self.cursor = self.start_connection.cursor()
+
+    def connect_to_postgres(self):
+        connection = psycopg2.connect(**self.db_config)
+        return connection
+
+    def create_schema_if_not_exists(self, schema_name):
+        try:
+            self.cursor.execute(
+                f"SELECT schema_name FROM information_schema.schemata WHERE schema_name = '{schema_name}'")
+            schema_exists = self.cursor.fetchone()
+            if not schema_exists:
+                self.cursor.execute(f"CREATE SCHEMA IF NOT EXISTS \"{schema_name}\"")
+                self.start_connection.commit()
+                print(f"Schema '{schema_name}' created successfully.")
+            else:
+                print(f"Schema '{schema_name}' already exists.")
+        except Exception as e:
+            print(f"Error while creating schema: {e}")
+            self.start_connection.rollback()
+
+    async def parse(self, content: IO) -> AsyncGenerator:
+        logger.info("Extracting text from '%s' using Azure Document Intelligence", content.name)
+
+        async with DocumentIntelligenceClient(endpoint=self.endpoint, credential=self.credential) as client:
+            poller = await client.begin_analyze_document(model_id=self.model_id, analyze_request=content,
+                                                         content_type="application/pdf")
+            result = await poller.result()
+
+            merged_tables = self.identify_and_merge_cross_page_tables(result)
+
+            for table_index, table in enumerate(merged_tables):
+                yield table_index + 1, table['page_num'], self.table_to_html(table['table'])
+
+    def identify_and_merge_cross_page_tables(self, result):
+        merged_tables = []
+        current_merged_table = None
+        current_page = None
+        num_of_columns = None
+
+        for idx, table in enumerate(result.tables):
+            page_numbers = get_table_page_numbers(table)
+            current_table_columns = len(set(cell.column_index for cell in table.cells))
+
+            if (current_merged_table is not None and
+                    page_numbers[0] == current_page + 1 and
+                    current_table_columns == num_of_columns):
+
+                current_merged_table = merge_vertical_tables(current_merged_table, table)
+                current_page = page_numbers[0]
+            else:
+                if current_merged_table is not None:
+                    merged_tables.append({
+                        'table': current_merged_table,
+                        'page_num': current_page
+                    })
+
+                current_merged_table = table
+                current_page = page_numbers[0]
+                num_of_columns = current_table_columns
+
+        if current_merged_table is not None:
+            merged_tables.append({
+                'table': current_merged_table,
+                'page_num': current_page
+            })
+
+        return merged_tables
+
+    @staticmethod
+    def table_to_html(table: DocumentTable):
+        table_html = "<table>"
+        rows = [sorted([cell for cell in table.cells if cell.row_index == i], key=lambda cell: cell.column_index) for i
+                in range(table.row_count)]
+        for row_cells in rows:
+            table_html += "<tr>"
+            for cell in row_cells:
+                tag = "th" if (cell.kind == "columnHeader" or cell.kind == "rowHeader") else "td"
+                cell_spans = ""
+                if cell.column_span is not None and cell.column_span > 1:
+                    cell_spans += f" colSpan={cell.column_span}"
+                if cell.row_span is not None and cell.row_span > 1:
+                    cell_spans += f" rowSpan={cell.row_span}"
+                table_html += f"<{tag}{cell_spans}>{html.escape(cell.content)}</{tag}>"
+            table_html += "</tr>"
+        table_html += "</table>"
+        return table_html
+
+    @staticmethod
+    def to_excel_in_memory(html_content: str) -> Workbook:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        tables = soup.find_all('table')
+
+        wb = Workbook()
+        ws = wb.active
+        current_row = 1
+        col_offset = {}
+
+        for table_index, table in enumerate(tables):
+            for row in table.find_all('tr'):
+                current_col = 1
+                for cell in row.find_all(['td', 'th']):
+                    cell_value = cell.get_text(strip=True)
+                    rowspan = int(cell.get('rowspan', 1))
+                    colspan = int(cell.get('colspan', 1))
+
+                    while (current_row, current_col) in col_offset:
+                        current_col += 1
+
+                    ws.cell(row=current_row, column=current_col, value=cell_value)
+
+                    if rowspan > 1 or colspan > 1:
+                        end_row = current_row + rowspan - 1
+                        end_col = current_col + colspan - 1
+                        ws.merge_cells(start_row=current_row, start_column=current_col, end_row=end_row,
+                                       end_column=end_col)
+
+                        for r in range(current_row, current_row + rowspan):
+                            for c in range(current_col, current_col + colspan):
+                                col_offset[(r, c)] = True
+
+                    current_col += 1
+                current_row += 1
+
+            if table_index < len(tables) - 1:
+                current_row += 3
+
+        return wb
+
+    def workbook_to_postgres_in_memory(self, workbook, table_name, db_uri, schema_name):
+        sheet = workbook.active
+        merged_cells_map = {}
+        for merged_cell_range in sheet.merged_cells.ranges:
+            start_cell = merged_cell_range.min_row, merged_cell_range.min_col
+            end_cell = merged_cell_range.max_row, merged_cell_range.max_col
+            cell_value = sheet.cell(row=start_cell[0], column=start_cell[1]).value
+            for row in range(start_cell[0], end_cell[0] + 1):
+                for col in range(start_cell[1], end_cell[1] + 1):
+                    merged_cells_map[(row, col)] = cell_value
+
+        data = []
+        columns = []
+
+        for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            row_data = []
+            for col_idx, cell in enumerate(row, start=1):
+                cell_value = merged_cells_map.get((row_idx, col_idx), cell)
+                if row_idx == 1:  
+                    columns.append(cell_value)
+                else:
+                    row_data.append(cell_value)
+
+            if row_idx > 1:  
+                data.append(row_data)
+        columns = [f"Unnamed_{i}" if not col or str(col).strip() == "" else col for i, col in enumerate(columns)]
+        df = pd.DataFrame(data, columns=columns)
+        rename_duplicate_columns(df)
+        engine = create_engine(db_uri)
+        self.create_schema_if_not_exists(schema_name)
+        with engine.connect() as connection:
+            df.to_sql(table_name, con=connection, schema=schema_name, if_exists='replace', index=False)
+            print(f"Table '{table_name}' uploaded successfully to schema '{schema_name}'.")
+
+    async def pdf_to_postgres(self, pdf_path: str):
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"The file {pdf_path} does not exist.")
+        pdf_basename = os.path.basename(pdf_path).rsplit('.', 1)[0]
+        with open(pdf_path, "rb") as pdf_file:
+            async for table_index, page_num, page_text in self.parse(pdf_file):
+                html_output = page_text
+                workbook = self.to_excel_in_memory(html_output)
+                table_name = f"{pdf_basename}_T{table_index:03}_P{page_num:03}"
+                self.workbook_to_postgres_in_memory(
+                    workbook=workbook,
+                    table_name=table_name,
+                    db_uri=self.db_uri,
+                    schema_name=self.schema_name
+                )
+                del workbook, html_output
+                gc.collect()
+
