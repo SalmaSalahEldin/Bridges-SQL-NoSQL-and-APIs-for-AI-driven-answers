@@ -1,0 +1,321 @@
+import warnings
+from langchain._api import LangChainDeprecationWarning
+import os
+import psycopg2
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+from openai import OpenAI
+from version_one.SQL_Agent import PostgreSQLAgent
+import asyncio
+from dotenv import load_dotenv
+
+warnings.simplefilter("ignore", category=LangChainDeprecationWarning)
+
+class AiGenerateAnswerService:
+    def __init__(self, company_id=None):
+        load_dotenv()
+        self.db_config = {
+            "dbname": os.environ.get("DB_NAME_V1"),
+            "user": os.environ.get("DB_USER_V1"),
+            "password": os.environ.get("DB_PASSWORD_V1"),
+            "host": os.environ.get("DB_HOST_V1"),
+            "port": int(os.environ.get("DB_PORT_V1", "5432"))
+        }
+        self.start_connection = self.connect_to_postgres()
+        self.cursor = self.start_connection.cursor()
+        self.company_id = "mate" + str(company_id)
+        self.csv_directory = os.path.join("tables", self.company_id)
+        self.API_KEY = os.environ["OPENAI_API_KEY"]
+        self.open_ai_client = OpenAI()
+        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        self.company_path_chunks = os.path.join("Chroma", self.company_id, "chunks")
+        self.company_path_questions = os.path.join("Chroma", self.company_id, "questions")
+        self.questions_collection_name = 'questions' + self.company_id
+        self.questions_vectorstore = Chroma(
+            collection_name=f'questions{self.company_id}',
+            embedding_function=self.embeddings,
+            persist_directory=self.company_path_questions,
+        )
+        self.collection_name = self.company_id
+        self.chunks_vectorstore = Chroma(
+            collection_name=self.company_id,
+            embedding_function=self.embeddings,
+            persist_directory=self.company_path_chunks,
+        )
+
+        self.SYSTEM_PROMPT = "You are a smart and intelligent Named Entity Recognition (NER) system. I will provide you the definition of the entities you need to extract, the sentence from where your extract the entities and the output format with examples."
+
+        self.GUIDELINES_PROMPT = (
+            "Entity Definition:\n"
+            "1. PERSON: Short name or full name of a person from any geographic regions.\n"
+            "2. DATE: Any format of dates. Dates can also be in natural language.\n"
+            "3. LOC: Name of any geographic location, like cities, countries, continents, districts etc.\n"
+            "4. ORG: Name of any organization, company, institution, etc.\n"
+            "5. UNKNOWN: words that don't make sense in any language or dialect and not common parts of speech such as nouns, verbs, pronouns, prepositions, question words, or demonstrative pronouns in any language.\n"
+            "\n"
+            "Output Format:\n"
+            "{{'PERSON': [list of entities present], 'DATE': [list of entities present], 'LOC': [list of entities present], 'ORG': [list of entities present], 'UNKNOWN': [list of entities present]}}\n"
+            "If no entities are presented in any categories keep it None\n"
+            "\n"
+            "Examples:\n"
+            "\n"
+            "1. Sentence: Mr. Jacob lives in Madrid since 12th January 2015.\n"
+            "Output: {{'PERSON': ['Mr. Jacob'], 'DATE': ['12th January 2015'], 'LOC': ['Madrid'], 'ORG': ['None'], 'UNKNOWN': ['None']}}\n"
+            "\n"
+            "2. Sentence: Mr. Rajeev Mishra and Sunita Roy are friends and they meet each other on 24/03/1998.\n"
+            "Output: {{'PERSON': ['Mr. Rajeev Mishra', 'Sunita Roy'], 'DATE': ['24/03/1998'], 'LOC': ['None'], 'ORG': ['None'], 'UNKNOWN': ['None']}}\n"
+            "\n"
+            "3. Sentence: John Doe works at Microsoft in Seattle.\n"
+            "Output: {{'PERSON': ['John Doe'], 'DATE': ['None'], 'LOC': ['Seattle'], 'ORG': ['Microsoft'], 'UNKNOWN': ['None']}}\n"
+            "\n"
+            "4. Sentence: give me information about Arkleap.\n"
+            "Output: {{'PERSON': ['None'], 'DATE': ['None'], 'LOC': ['None'], 'ORG': ['None'], 'UNKNOWN': ['Arkleap']}}\n"
+            "\n"
+            "5. Sentence: ما هي البتاعة.\n"
+            "Output: {{'PERSON': ['None'], 'DATE': ['None'], 'LOC': ['None'], 'ORG': ['None'], 'UNKNOWN': ['البتاعة']}}\n"
+            "\n"
+            "6. Sentence: {}\n"
+            "Output: "
+        )
+
+    def connect_to_postgres(self):
+        connection = psycopg2.connect(**self.db_config)
+        return connection
+
+    def close_connection(self):
+        self.start_connection.close()
+
+    def _response(self, data, type, more_data=None):
+        response = {"data": data, "type": type, "more_data": more_data}
+        return response
+
+    def NER(self, final_prompt):
+        response = self.open_ai_client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": final_prompt}
+            ]
+        )
+
+        return response.choices[0].message.content
+
+    async def get_csv_answer(self, query):
+        sql_agent = PostgreSQLAgent(
+            company_id=self.company_id,
+        )
+        try:
+            csv_answer = sql_agent.invoke_agent(query)
+            return self._response(csv_answer, "validation")
+
+        except Exception as e:
+            error_message = f"Error fetching CSV answer: {e}"
+            return self._response(error_message, "error")
+
+    def _openai_answer(self, query, history, results_documents, csv_response):
+        if csv_response["type"] == "error":
+            return csv_response 
+
+        csv_answer = csv_response["data"]
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "As a multilingual assistant, you are tasked with interpreting and responding to user queries based strictly on the content of the provided PDF documents {results_documents} and answers derived from the csv files {csv_answer}."
+                    " Your responses must be strictly based on these sources and never rely on external knowledge or assumptions not detailed within. Accuracy and specificity are paramount."
+
+                    "\n\nGeneral Instructions:"
+                    "\n- NEVER answer questions that aren't related to the documents or the content provided in {csv_answer}, and never rely on any external knowledge."
+                    "\n- Make sure the response directly addresses the user's query without including any irrelevant information."
+                    "\n- If the question is unclear or incomplete, ask for a more detailed and clear question."
+
+                    "\n- ALWAYS prioritize answers from {csv_answer} over the PDFs when both sources contain relevant information."
+                    "\n- If there is an answer from {csv_answer} and no answers from the PDFs, you should never ignore the answers derived from {csv_answer}, so use it in all cases."
+                    "\n- If the query has an answer in both the PDFs from {results_documents} and {csv_answer}, ALWAYS use the answer from {csv_answer} as the most accurate."
+                    "\n- Only if no relevant answer is found in {csv_answer} should you then refer to the PDFs in {results_documents} for relevant information."
+                    "\n- If there is no relevant answer in {csv_answer} and no relevant answer in the PDFs, clearly state that the information is not available based on the provided data sources."
+
+                    "\n- Ensure to always answer the entire query, not just a part of it. If the query requires information from both {csv_answer} and the PDFs, include all relevant answers from each source."
+                    "\n- Always present the most recent answers first, followed by older information. Clarify to the user if newer policies or data affect the answer."
+                    "\n- Provide responses in the same language as the query without mixing in other languages."
+                    "\n- Avoid including any irrelevant information, assumptions, or external knowledge."
+                    "\n- DO NOT include any extra formatting in your answers; just provide the plain string (e.g., do not include '**Response:**' in your response)."
+                    "\n- When users ask questions, recognize and consider variations of the same question to understand the key intent. Identify the main keywords and provide details based on these keywords."
+                    "\n- Handle misspellings and variations in spelling when interpreting user queries to ensure accurate and relevant responses."
+                    "\n- Recognize variations of the same keywords to ensure accurate responses. Specify the exact term found in the document or {csv_answer} in your answer while understanding the broader context."
+                    "\n- Answer from {csv_answer} could be in a different language from the query's language. If so, you should translate it to finally formulate the answer in the same language as the query's language."
+
+                    "\n\nHandling Cases When No Suitable Answer is Found:"
+                    "\n1. **Re-check All Sources:** Thoroughly review all provided documents {results_documents} and the content in {csv_answer} to ensure no relevant information was overlooked."
+                    "\n2. **Final Response if No Answer or Related Question is Found:** If no suitable answer after thoroughly checking all {results_documents} and {csv_answer}, respond with: 'Sorry, but this question isn't covered in your PDFs.'"
+
+                    "\n\nChecking {csv_answer}:"
+                    "\n- You will be provided with an answer in {csv_answer}. Always consider this first before answering the user's question."
+                    "\n- If the user's question relates to the content in {csv_answer}, ensure to base your answer on the information provided there."
+                    "\n- If the answer is found in both {csv_answer} and the PDFs, prioritize the answer from {csv_answer} and ignore the PDFs."
+                    "\n- The answer derived from {csv_answer} is generally more reliable, so treat it as the definitive source."
+                    "\n- If {csv_answer} does not provide the answer, then you may rely on the PDFs for the response."
+
+                    "\n\nFinancial Queries Instructions:"
+                    "\n- Provide a comprehensive breakdown, clearly distinguishing between business and personal contexts."
+                    "\n- For business-related expenses, detail the type of expenses allowed, any caps or policy restrictions, the process for claiming reimbursements, and specifics of any provided allowances or per diems."
+                    "\n- For personal expenses, including vacation planning, clearly state that such expenses fall outside company coverage but may reference applicable personal leave policies or out-of-pocket considerations."
+                    "\n- Directly address the query's financial aspect with a keen emphasis on distinguishing between business and personal/vacation purposes, eliminating any potential for confusion."
+
+                    "\n\nExample Responses for Financial Queries:"
+                    "\n- For business expenses: 'Business travel expenses are capped at $500 per trip, covering airfare, lodging, and a daily meal allowance of $60, subject to prior approval.'"
+                    "\n- For personal expenses: 'Personal vacation costs, such as flights and hotels, are the employee's responsibility. Employees are entitled to 15 days of paid vacation leave annually, with approval required.'"
+
+                    "\n\nQueries Spanning Multiple PDFs and {csv_answer}:"
+                    "\n- The user may ask a question that requires answers from multiple documents or {csv_answer}. In such cases, you should mention all the relevant answers to provide a complete response."
+                    "\n- Always make sure that your response has meaning and relevance, especially when you respond in Arabic."
+
+                    "\n\nRemember:"
+                    "\n- Remember that you are allowed to answer based only on the information derived from the PDF documents {results_documents} and the content from {csv_answer}, and you should never rely on any external knowledge."
+                    "\n- Remember that you should always use the answer coming from {csv_answer} and never ignore it."
+                    "\n- Always ensure that your answer is relevant to the user's question."
+                    "\n- Always make sure to respond in the same language the user used to ask the question, without mixing languages."
+
+                    "\n\nError Handling:"
+                    "\n- If any errors occur during the process or if you cannot find the relevant information, respond only with: 'Sorry, but this question isn't covered in your PDFs.' Ensure that the user is never exposed to system or model-related errors."
+                )
+            }
+        ]
+
+        if history is not None:
+            for response in history:
+                messages.append({"role": "user", "content": str(response['question'])})
+                messages.append({"role": "assistant", "content": str(response['answer'])})
+
+        messages.append({"role": "user", "content": query})
+        messages.append({"role": "user", "content": f"Information from PDF documents: {results_documents}"})
+        messages.append({"role": "user",
+                         "content": f"The information provided here from CSV files is the most accurate and should always be prioritized. Never ignore this answer that is derived from CSV files: {csv_answer}"})
+        GUIDELINES_PROMPT = self.GUIDELINES_PROMPT.format(query)
+        extracted_entities = self.NER(GUIDELINES_PROMPT)
+        messages.append({"role": "user",
+                         "content": f"The following entities, such as names, locations, or dates, have been extracted. You must ensure that this information is completely transparent to the user. However, you are not allowed to explicitly reveal the extracted entities to the user. Instead, use them to avoid any misspellings, especially in names: {extracted_entities}"})
+
+        response = self.open_ai_client.chat.completions.create(model="gpt-4o", messages=messages, temperature=0)
+        answer = response.choices[0].message.content
+        return [{"role": "assistant", "content": answer}]
+
+
+    async def _add_to_db(self, query, question_id, history, metadatas):
+        csv_task = asyncio.create_task(self.get_csv_answer(query))
+        self.cursor.execute(f"SELECT * FROM pdf_questions_ids WHERE id = '{question_id}'")
+        existing_question = self.cursor.fetchone()
+        if existing_question:
+            return self._response(
+                f"Question ID '{question_id}' already exists for company '{self.company_id}'. Please use a unique question ID.",
+                "error",
+            )
+        results = self.chunks_vectorstore.similarity_search(query, k=3)
+
+        if len(results) == 0:
+            return self._response("You should add documents first", "Error")
+        else:
+            try:
+
+                dbchunks = self.questions_vectorstore.from_texts(
+                    texts=[query],
+                    embedding=self.embeddings,
+                    metadatas=metadatas,
+                    ids=[question_id],
+                    persist_directory=self.company_path_questions,
+                    collection_name=self.questions_collection_name,
+                )
+
+                dbchunks.persist()
+
+            except Exception as e:
+                print(f"Error in creating questions collection: {e}")
+
+            results_documents = []
+            results_metadata = []
+
+            for result in results:
+                content = result.page_content
+                results_documents.append(content)
+                metadata = result.metadata
+                unique_filename = metadata.get("UniqueFileName", "Unknown")
+                user_friendly_name = metadata.get("UserFriendlyName", "Unknown")
+
+                results_metadata.append({
+                    "UniqueFileName": unique_filename,
+                    "UserFriendlyName": user_friendly_name,
+                })
+
+            for i in range(min(5, len(results_metadata))):
+                results_documents[i] = f"In {results_metadata[i]['UniqueFileName']}" + \
+                                       results_documents[i]
+
+            context = ",".join(str(x) for x in results_documents)
+            results_documents = context
+            data_list = []
+            for metadata in results_metadata:
+                current_unique_filename = metadata["UniqueFileName"]
+                if current_unique_filename not in data_list:
+                    self.cursor.execute(
+                        "INSERT INTO pdf_questions_ids (pdf_name, id) VALUES (%s, %s)",
+                        (current_unique_filename, question_id),
+                    )
+                    data_list.append(current_unique_filename)
+            self.start_connection.commit()
+        csv_response = await csv_task
+        return self._openai_answer(query, history, results_documents, csv_response)
+
+    def generate_answer(self, question_id, query, history, flag=True):
+        try:
+            # classification_result = self._classify_query(query)
+            # query_type = classification_result["query_type"]
+            # language = classification_result["language"]
+            # if query_type in ["Greeting", "Gratitude"]:
+            #     response = self._generate_response_to_classified_query(query_type, language, query)
+            #     return self._response(response, "answer")
+            if self.company_id is None:
+                return self._response("please enter an id to process on the prompt", "error")
+            if query is None or query == "":
+                return self._response("please enter a query to process", "error")
+            ids = []
+            metadatas = [{"question_id": question_id}]
+            if (flag):
+                try:
+                    similar_questions = self.questions_vectorstore.similarity_search_with_relevance_scores(
+                        query=query,
+                        k=3,
+                        score_threshold=0.8
+                    )
+                    if not similar_questions:
+                        pass
+                    else:
+                        for similar_question in similar_questions:
+                            question_document, question_score = similar_question
+                            question_metadata = question_document.metadata
+                            id = question_metadata.get('question_id')
+                            if id != question_id:
+                                ids.append(id)
+                except Exception as e:
+                    return self._response(e, "Error")
+                if ids:
+                    return self._response(ids, "similarity")
+                else:
+                    return asyncio.run(self._add_to_db(query, question_id, history, metadatas))
+            else:
+                return asyncio.run(self._add_to_db(query, question_id, history, metadatas))
+
+        except Exception as e:
+            return self._response(f"{e}", "error")
+
+    def fake_date(self, query):
+        if query == "question_1":
+            return self._response("answer_1", "answer")
+        elif query == "question_2":
+            ids = []
+            return self._response(ids, "similarity")
+        elif query == "question_3":
+            e = "error"
+            return self._response(e, "error")
+        else:
+            return self._response("no answer", 'answer')
